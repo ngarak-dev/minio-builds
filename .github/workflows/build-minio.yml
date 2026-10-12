@@ -1,0 +1,254 @@
+name: Build MinIO
+
+on:
+  workflow_dispatch:
+    inputs:
+      minio_tag:
+        description: "Upstream minio/minio tag to build"
+        required: true
+        default: "RELEASE.2025-10-15T17-29-55Z"
+      mc_tag:
+        description: "Upstream minio/mc release to re-publish"
+        required: true
+        default: "RELEASE.2025-08-13T08-35-41Z"
+      force:
+        description: "Rebuild and overwrite the assets if the release already exists"
+        type: boolean
+        default: false
+  # Weekly: builds the newest upstream tags only if no release exists for them yet.
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-minio-${{ inputs.minio_tag || 'scheduled' }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      minio_tag: ${{ steps.tags.outputs.minio_tag }}
+      mc_tag: ${{ steps.tags.outputs.mc_tag }}
+      build: ${{ steps.tags.outputs.build }}
+    steps:
+      - name: Resolve tags and check for an existing release
+        id: tags
+        env:
+          IN_MINIO: ${{ inputs.minio_tag }}
+          IN_MC: ${{ inputs.mc_tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          newest_tag() {
+            git ls-remote --tags --refs "https://github.com/$1.git" 'RELEASE.*' \
+              | awk -F/ '{print $3}' | grep -E '^RELEASE\.[0-9-]+T[0-9-]+Z$' | sort | tail -n1
+          }
+          minio=${IN_MINIO:-$(newest_tag minio/minio)}
+          mc=${IN_MC:-$(newest_tag minio/mc)}
+          re='^RELEASE\.[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z$'
+          [[ $minio =~ $re ]] || { echo "::error::Invalid minio tag: $minio"; exit 1; }
+          [[ $mc =~ $re ]] || { echo "::error::Invalid mc tag: $mc"; exit 1; }
+          build=true
+          if gh release view "$minio" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [[ $FORCE == true ]]; then
+              echo "Release $minio exists - force=true, assets will be overwritten."
+            else
+              echo "Release $minio already exists - nothing to do (use force=true to rebuild)."
+              build=false
+            fi
+          fi
+          {
+            echo "minio_tag=$minio"
+            echo "mc_tag=$mc"
+            echo "build=$build"
+          } >>"$GITHUB_OUTPUT"
+          echo "### minio $minio / mc $mc - build: $build" >>"$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ needs.prepare.outputs.minio_tag }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out minio/minio at ${{ needs.prepare.outputs.minio_tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: minio/minio
+          ref: ${{ needs.prepare.outputs.minio_tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go (from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build (same flags as upstream `make build`)
+        run: |
+          set -euo pipefail
+          # gen-ldflags.go expects the release time as 2006-01-02T15:04:05Z
+          ts="$(sed -E 's/^RELEASE\.(.*)T([0-9]{2})-([0-9]{2})-([0-9]{2})Z$/\1T\2:\3:\4Z/' <<<"$TAG")"
+          ldflags="$(MINIO_RELEASE=RELEASE go run buildscripts/gen-ldflags.go "$ts")"
+          echo "ldflags: $ldflags"
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
+            go build -tags kqueue -trimpath --ldflags "$ldflags" -o "dist/minio.linux-$ARCH.$TAG" .
+          go version | tee "dist/go-version-$ARCH.txt"
+          git rev-parse HEAD | tee "dist/commit-$ARCH.txt"
+
+      - name: Verify the binary
+        run: |
+          set -euo pipefail
+          bin="dist/minio.linux-$ARCH.$TAG"
+          file "$bin"
+          "$bin" --version | tee version.txt
+          grep -q " version $TAG (commit-id=$(git rev-parse HEAD))" version.txt
+          grep -q "linux/$ARCH" version.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minio-linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.minio_tag }}
+      MC_TAG: ${{ needs.prepare.outputs.mc_tag }}
+    steps:
+      - name: Check out minio/minio (source tarball + LICENSE)
+        uses: actions/checkout@v4
+        with:
+          repository: minio/minio
+          ref: ${{ needs.prepare.outputs.minio_tag }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: minio-src
+
+      - name: Check out minio/mc (source tarball)
+        uses: actions/checkout@v4
+        with:
+          repository: minio/mc
+          ref: ${{ needs.prepare.outputs.mc_tag }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: mc-src
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Fetch and verify upstream mc binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist mc-upstream
+          for arch in amd64 arm64; do
+            f="mc.linux-$arch.$MC_TAG"
+            gh release download "$MC_TAG" -R minio/mc -D mc-upstream -p "$f" -p "$f.sha256sum"
+            want="$(awk 'NR==1 {print $1}' "mc-upstream/$f.sha256sum")"
+            got="$(sha256sum "mc-upstream/$f" | awk '{print $1}')"
+            [[ $want =~ ^[0-9a-f]{64}$ && $want == "$got" ]] \
+              || { echo "::error::Upstream checksum mismatch for $f ($want vs $got)"; exit 1; }
+            echo "$f: upstream sha256 OK ($got)"
+            chmod +x "mc-upstream/$f"
+            cp "mc-upstream/$f" "dist/$f"
+            cp "mc-upstream/$f" "dist/mc-linux-$arch"
+          done
+          "dist/mc-linux-amd64" --version | grep -q " version $MC_TAG "
+
+      - name: Assemble release assets
+        id: assets
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            f="minio.linux-$arch.$TAG"
+            install -m 0755 "artifacts/$f" "dist/$f"
+            cp "dist/$f" "dist/minio-linux-$arch"
+          done
+          git -C minio-src archive --format=tar.gz --prefix="minio-$TAG/" -o "$PWD/dist/minio-$TAG-source.tar.gz" HEAD
+          git -C mc-src archive --format=tar.gz --prefix="mc-$MC_TAG/" -o "$PWD/dist/mc-$MC_TAG-source.tar.gz" HEAD
+          cp minio-src/LICENSE dist/LICENSE
+
+          minio_commit="$(git -C minio-src rev-parse HEAD)"
+          mc_commit="$(git -C mc-src rev-parse HEAD)"
+          go_version="$(awk '{print $3}' artifacts/go-version-amd64.txt)"
+          [[ $(cat artifacts/commit-amd64.txt) == "$minio_commit" && $(cat artifacts/commit-arm64.txt) == "$minio_commit" ]]
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          cat >dist/VERSIONS <<EOF
+          MINIO_RELEASE=${TAG#RELEASE.}
+          MC_RELEASE=${MC_TAG#RELEASE.}
+          MINIO_COMMIT=$minio_commit
+          MC_COMMIT=$mc_commit
+          GO_VERSION=$go_version
+          BUILD_RUN=$run_url
+          EOF
+          sed -i 's/^ *//' dist/VERSIONS
+
+          (
+            cd dist
+            for f in minio.linux-* minio-linux-* mc.linux-* mc-linux-*; do
+              sha256sum "$f" >"$f.sha256sum"
+            done
+            sha256sum -- * | grep -v '\.sha256sum$' >SHA256SUMS
+            cat SHA256SUMS
+          )
+
+          cat >notes.md <<EOF
+          **Unofficial, unmodified builds** of upstream MinIO - not affiliated with or endorsed by MinIO, Inc.
+          MinIO is a trademark of MinIO, Inc. Licensed under the GNU AGPL v3 (see \`LICENSE\`).
+
+          | Component | Upstream tag | Upstream commit | Binaries |
+          |---|---|---|---|
+          | minio server | [\`$TAG\`](https://github.com/minio/minio/tree/$TAG) | \`$minio_commit\` | built from source here with \`$go_version\` |
+          | mc client | [\`$MC_TAG\`](https://github.com/minio/mc/releases/tag/$MC_TAG) | \`$mc_commit\` | official upstream binaries, re-published after verifying upstream SHA256 |
+
+          - Build: \`CGO_ENABLED=0 go build -tags kqueue -trimpath --ldflags "\$(MINIO_RELEASE=RELEASE go run buildscripts/gen-ldflags.go <release time>)"\` (same as upstream \`make build\`), on native linux/amd64 and linux/arm64 GitHub runners.
+          - Workflow run: $run_url
+          - Corresponding source: \`minio-$TAG-source.tar.gz\` and \`mc-$MC_TAG-source.tar.gz\` (\`git archive\` of the upstream tags; Go module dependencies are pinned by \`go.sum\`).
+          - Verify: download \`SHA256SUMS\` and run \`sha256sum -c --ignore-missing SHA256SUMS\`.
+          EOF
+          sed -i 's/^          //' notes.md
+
+          current="$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || true)"
+          latest=true
+          if [[ -n $current && $current != "$TAG" && $TAG < $current ]]; then latest=false; fi
+          echo "latest=$latest" >>"$GITHUB_OUTPUT"
+          echo "Current latest release: ${current:-none} -> mark $TAG as latest: $latest"
+
+      - name: Publish GitHub release
+        env:
+          LATEST: ${{ steps.assets.outputs.latest }}
+        run: |
+          set -euo pipefail
+          title="MinIO $TAG + mc $MC_TAG (unofficial build)"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "$title" --notes-file notes.md --latest="$LATEST"
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$title" --notes-file notes.md --latest="$LATEST" dist/*
+          fi
+          echo "Published: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG" >>"$GITHUB_STEP_SUMMARY"
