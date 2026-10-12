@@ -13,6 +13,21 @@ Why this exists: the community repository `minio/minio` is archived, `dl.min.io`
 serves community binaries (HTTP 410), and the security-fix release
 `RELEASE.2025-10-15T17-29-55Z` was published as source code only.
 
+## Install on Ubuntu
+
+The [MinIO fresh install scripts for Ubuntu](https://gist.github.com/ngarak-dev/3eaced97b592b1f6b947f880585aca1c)
+install these binaries on Ubuntu 22.04 / 24.04 (amd64, arm64): server, systemd service,
+`mc`, bucket and least-privilege user, Nginx, UFW, verification, backups and upgrades.
+
+```bash
+wget -qO- https://gist.githubusercontent.com/ngarak-dev/3eaced97b592b1f6b947f880585aca1c/raw/get.sh | bash
+cd minio-install-scripts
+sudo ./install-all.sh --dry-run   # review the effective config first
+sudo ./install-all.sh
+```
+
+Step-by-step walkthrough: [GUIDE.md](GUIDE.md).
+
 ## Releases
 
 One GitHub release per upstream server tag, e.g.
@@ -82,7 +97,8 @@ A weekly scheduled run builds the newest upstream tags only if no release exists
 
 ## Used by
 
-The MinIO install scripts (`DOWNLOAD_SOURCE="github"`, the default) download from this
+The [MinIO fresh install scripts for Ubuntu](https://gist.github.com/ngarak-dev/3eaced97b592b1f6b947f880585aca1c)
+(`DOWNLOAD_SOURCE="github"`, the default; see [GUIDE.md](GUIDE.md)) download from this
 repository: pinned releases from `releases/download/RELEASE.<tag>/`, `latest` via the
 GitHub API (`/repos/ngarak-dev/minio-builds/releases/latest`, falling back to the
 `releases/latest` redirect), the matching `mc` version from the release's `VERSIONS`
